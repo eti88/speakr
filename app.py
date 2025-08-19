@@ -1,30 +1,31 @@
 # Speakr - Audio Transcription and Summarization App
 import os
 import sys
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash, Response
 from urllib.parse import urlparse, urljoin
 try:
     from flask import Markup
 except ImportError:
-    from markupsafe import Markup
-from flask_sqlalchemy import SQLAlchemy
+    from markupsafe import Markup # type: ignore
+from flask_sqlalchemy import SQLAlchemy # type: ignore
 from datetime import datetime
-from openai import OpenAI # Keep using the OpenAI library
+from openai import OpenAI # Keep using the OpenAI library # type: ignore
 import json
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy import select # type: ignore
+from sqlalchemy.orm import joinedload # type: ignore
 import threading
 from dotenv import load_dotenv # Import load_dotenv
-import httpx 
+import httpx # type: ignore
 import re
 import subprocess
 import mimetypes
 import markdown
-import bleach
-
+import bleach # type: ignore
+import redis
 # Add common audio MIME type mappings that might be missing
 mimetypes.add_type('audio/mp4', '.m4a')
 mimetypes.add_type('audio/aac', '.aac')
@@ -32,14 +33,14 @@ mimetypes.add_type('audio/x-m4a', '.m4a')
 mimetypes.add_type('audio/webm', '.webm')
 mimetypes.add_type('audio/flac', '.flac')
 mimetypes.add_type('audio/ogg', '.ogg')
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_bcrypt import Bcrypt
-from flask_wtf import FlaskForm
-from flask_wtf.csrf import CSRFProtect
-from wtforms import StringField, PasswordField, SubmitField, BooleanField
-from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user # type: ignore
+from flask_bcrypt import Bcrypt # type: ignore
+from flask_wtf import FlaskForm # type: ignore
+from flask_wtf.csrf import CSRFProtect # type: ignore
+from wtforms import StringField, PasswordField, SubmitField, BooleanField # type: ignore
+from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError # type: ignore
+from flask_limiter import Limiter # type: ignore
+from flask_limiter.util import get_remote_address # type: ignore
 import pytz
 from babel.dates import format_datetime
 import ast
@@ -50,7 +51,7 @@ from audio_chunking import AudioChunkingService, ChunkProcessingError, ChunkingN
 
 # Optional imports for embedding functionality
 try:
-    import numpy as np
+    import numpy as np # type: ignore
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
     EMBEDDINGS_AVAILABLE = True
@@ -68,6 +69,9 @@ except ImportError as e:
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Configure Redis connection (adjust host/port/db as needed)
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
 # Early check for Inquire Mode configuration (needed for startup message)
 ENABLE_INQUIRE_MODE = os.environ.get('ENABLE_INQUIRE_MODE', 'false').lower() == 'true'
@@ -102,7 +106,7 @@ app_logger.addHandler(handler)
 limiter = Limiter(
     get_remote_address,
     app=None,  # Defer initialization
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=["20000 per day", "5000 per hour"]
 )
 
 def auto_close_json(json_string):
@@ -586,7 +590,7 @@ def generate_embeddings(texts):
     
     try:
         embeddings = model.encode(texts)
-        return [embedding.astype(np.float32) for embedding in embeddings]
+        return [embedding.astype(np.float32) for embedding in embeddings]  # type: ignore
     except Exception as e:
         app.logger.error(f"Error generating embeddings: {e}")
         return []
@@ -601,7 +605,7 @@ def deserialize_embedding(binary_data):
     """Convert binary data back to numpy array."""
     if binary_data is None or not EMBEDDINGS_AVAILABLE:
         return None
-    return np.frombuffer(binary_data, dtype=np.float32)
+    return np.frombuffer(binary_data, dtype=np.float32)  # type: ignore
 
 def process_recording_chunks(recording_id):
     """
@@ -697,7 +701,7 @@ def basic_text_search_chunks(user_id, query, filters=None, top_k=5):
                 text_conditions.append(TranscriptChunk.content.ilike(f'%{word}%'))
             
             # Combine conditions with OR
-            from sqlalchemy import or_
+            from sqlalchemy import or_ # type: ignore
             chunks_query = chunks_query.filter(or_(*text_conditions))
         
         # Get chunks and return with dummy similarity scores
@@ -789,7 +793,7 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
                     similarity = cosine_similarity(
                         query_embedding.reshape(1, -1),
                         chunk_embedding.reshape(1, -1)
-                    )[0][0]
+                    )[0][0]  # type: ignore
                     chunk_similarities.append((chunk, float(similarity)))
             except Exception as e:
                 app.logger.warning(f"Error calculating similarity for chunk {chunk.id}: {e}")
@@ -1139,7 +1143,7 @@ def create_share(recording_id):
     if not recording or recording.user_id != current_user.id:
         return jsonify({'error': 'Recording not found or you do not have permission to share it.'}), 404
         
-    data = request.json
+    data: Any = request.json
     share_summary = data.get('share_summary', True)
     share_notes = data.get('share_notes', True)
     
@@ -1166,7 +1170,7 @@ def get_shares():
 @login_required
 def update_share(share_id):
     share = Share.query.filter_by(id=share_id, user_id=current_user.id).first_or_404()
-    data = request.json
+    data: Any = request.json
     
     if 'share_summary' in data:
         share.share_summary = data['share_summary']
@@ -1352,7 +1356,7 @@ class LoginForm(FlaskForm):
 # Function to check and add columns if they don't exist
 def add_column_if_not_exists(engine, table_name, column_name, column_type):
     """Add a column to a table if it doesn't exist."""
-    from sqlalchemy import text
+    from sqlalchemy import text # type: ignore
     
     try:
         # Check if column exists
@@ -1418,7 +1422,7 @@ with app.app_context():
             
             # Update existing records to have proper order values (approximate by tag_id)
             try:
-                from sqlalchemy import text
+                from sqlalchemy import text # type: ignore
                 with engine.connect() as conn:
                     # Get existing associations without order values and assign them
                     existing_associations = conn.execute(text('''
@@ -2621,8 +2625,8 @@ def delete_all_speakers():
 def download_summary_word(recording_id):
     """Download recording summary as a Word document."""
     try:
-        from docx import Document
-        from docx.shared import Inches
+        from docx import Document # type: ignore
+        from docx.shared import Inches # type: ignore
         import re
         from io import BytesIO
         
@@ -5764,11 +5768,99 @@ def admin_inquire_status():
 with app.app_context():
     # Set dynamic MAX_CONTENT_LENGTH based on database setting
     max_file_size_mb = SystemSetting.get_setting('max_file_size_mb', 250)
+    if not max_file_size_mb or max_file_size_mb <= 0:
+        max_file_size_mb = 250  # Default
+
     app.config['MAX_CONTENT_LENGTH'] = max_file_size_mb * 1024 * 1024
     app.logger.info(f"Set MAX_CONTENT_LENGTH to {max_file_size_mb}MB from database setting")
 
     # Initialize file monitor after app setup
     initialize_file_monitor()
+
+## --- Mediamtx Stream Ingest (FFmpeg) ---
+@app.route('/start_stream_bot', methods=['POST'])
+@login_required
+def start_stream_bot():
+    req_json = request.get_json(silent=True) or {}
+    meet_url = req_json.get('meet_url')
+    user_id = current_user.id
+    session_id = request.cookies.get('session')
+    if not meet_url:
+        return jsonify({'error': 'Missing meet_url'}), 400
+    # Publish start request to Redis
+    
+    # valid statuses: deploy, stop, restart, status
+    payload = {
+        'command': 'deploy',
+        'meeting_id': meet_url.split('/')[-1],
+        'user_id': user_id,
+        'session_id': session_id
+    }
+    redis_client.publish('stream_bot_requests', json.dumps(payload))
+    return jsonify({'status': 'started'})
+
+@app.route('/stop_stream_bot', methods=['POST'])
+@login_required
+def stop_stream_bot():
+    user_id = current_user.id
+    session_id = request.cookies.get('session')
+    # Publish stop request to Redis
+    payload = {
+        'command': 'stop',
+        'user_id': user_id,
+        'session_id': session_id
+    }
+    redis_client.publish('stream_bot_requests', json.dumps(payload))
+    return jsonify({'status': 'stopped'})
+
+"""
+TODO: Backend
+
+Security: Validate and authenticate chunk uploads (ensure only authorized bot/Mediamtx can send).
+Recording management: Ensure each stream session creates/updates a proper Recording entry in the database.
+Robust error handling/logging for chunk processing failures.
+Optional: Endpoint for stream/bot status (for frontend polling).
+"""
+
+# Like MediaMTX instance
+@app.route('/api/stream_chunk', methods=['POST'])
+def receive_stream_chunk():
+    # Validate shared secret
+    import os
+    expected_secret = os.environ.get('STREAM_CHUNK_SECRET')
+    provided_secret = request.headers.get('X-Stream-Secret')
+    if not expected_secret or provided_secret != expected_secret:
+        app.logger.warning('Unauthorized stream chunk upload attempt')
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Get raw audio bytes from request
+    raw_bytes = request.data
+    # Optionally get metadata (user/session/recording_id) from headers or JSON
+    recording_id = request.headers.get('X-Recording-ID')
+    # Save chunk as temp WAV file
+    import wave, tempfile, os
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav', dir=app.config['UPLOAD_FOLDER']) as tmp_wav:
+        wf = wave.open(tmp_wav, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit PCM
+        wf.setframerate(16000)
+        wf.writeframes(raw_bytes)
+        wf.close()
+        tmp_wav_path = tmp_wav.name
+    # Enqueue for transcription/processing
+    try:
+        transcribe_single_file(tmp_wav_path, recording_id)
+    except Exception as e:
+        app.logger.error(f"Error processing stream chunk: {e}")
+        return jsonify({'error': 'Chunk processing failed'}), 500
+    # Clean up temp file
+    try:
+        os.remove(tmp_wav_path)
+    except Exception:
+        pass
+    return jsonify({'status': 'chunk processed'})
+
+## --- End Mediamtx Stream Ingest ---
 
 if __name__ == '__main__':
     # Consider using waitress or gunicorn for production

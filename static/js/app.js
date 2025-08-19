@@ -82,7 +82,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const micVisualizer = ref(null);
             const systemVisualizer = ref(null);
             const animationFrameId = ref(null);
-            const recordingMode = ref('microphone'); // 'microphone', 'system', or 'both'
+            const recordingMode = ref('microphone'); // 'microphone', 'system', 'both' or 'stream'
             const activeStreams = ref([]); // Track active streams for cleanup
             
             // --- Recording Size Monitoring ---

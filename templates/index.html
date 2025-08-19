@@ -49,6 +49,13 @@
         
         <!-- Header -->
         <header class="bg-[var(--bg-secondary)] border-b border-[var(--border-primary)] px-4 py-3 flex items-center justify-between flex-shrink-0 z-50">
+            <!-- Stream Bot Button -->
+            <div v-if="showStreamBot" class="mr-4">
+                <button @click="handleStreamBotClick" :class="['px-4 py-2 rounded-lg text-sm flex items-center gap-2 min-w-[120px] justify-center', isStreamBotActive ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-green-600 text-white hover:bg-green-700']">
+                    <i :class="isStreamBotActive ? 'fas fa-stop' : 'fas fa-robot'"></i>
+                    <span>{{ isStreamBotActive ? 'Stop Bot Stream' : 'Start Bot Stream' }}</span>
+                </button>
+            </div>
             <!-- Left side: Menu toggle and logo -->
             <div class="flex items-center gap-4">
                 <!-- Menu Toggle Button -->
@@ -126,6 +133,18 @@
         </header>
 
         <div class="flex-1 flex overflow-hidden relative">
+            <!-- Stream Bot Modal -->
+            <div v-if="showStreamBotModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                <div class="bg-[var(--bg-secondary)] rounded-lg shadow-xl w-full max-w-md p-6">
+                    <h3 class="text-lg font-semibold mb-4">Start Meeting Bot Stream</h3>
+                    <label class="block text-sm font-medium mb-2">Meeting URL</label>
+                    <input v-model="streamBotMeetUrl" type="text" class="w-full px-3 py-2 mb-4 bg-[var(--bg-input)] border border-[var(--border-secondary)] rounded-lg focus:outline-none focus:ring-2 focus:ring-[var(--ring-focus)]">
+                    <div class="flex justify-end gap-3">
+                        <button @click="showStreamBotModal = false" class="px-4 py-2 text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors">Cancel</button>
+                        <button @click="submitStreamBot" :disabled="!streamBotMeetUrl" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors">Start Bot</button>
+                    </div>
+                </div>
+            </div>
             <!-- Mobile Sidebar Backdrop -->
             <div v-if="!isSidebarCollapsed && isMobileScreen" 
                  @click="toggleSidebar"
@@ -356,6 +375,14 @@
                                     <i class="fas fa-desktop ml-1"></i>
                                     <span>Record Both</span>
                                 </button>
+
+                                <!-- Stream Audio Sources -->
+                                <button @click="startRecording('stream')"
+                                        class="w-full px-4 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors flex items-center justify-center gap-2">
+                                    <i class="fas fa-robot"></i>
+                                    <i class="fas fa-desktop ml-1"></i>
+                                    <span>Record Bot</span>
+                                </button>
                                 
                                 <!-- Help Text -->
                                 <div class="text-xs text-[var(--text-muted)] space-y-1 mt-3">
@@ -380,6 +407,10 @@
                                         <button @click="showSystemAudioHelp = true" class="ml-2 text-blue-500 hover:text-blue-600 underline text-sm">
                                             Help
                                         </button>
+                                    </div>
+                                    <div class="flex items-center justify-between">
+                                        <span><strong>Bot Streaming:</strong> Records meeting participants and system sounds through the ffempeg stream from dedicated instance (google,microsoft,zoom)</span>
+                                        <i class="fas fa-desktop text-blue-500 flex-shrink-0"></i>
                                     </div>
                                 </div>
                             </div>
@@ -2239,5 +2270,57 @@
     
     <!-- Vue.js Application Script -->
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script>
+    const { createApp } = Vue;
+    createApp({
+        data() {
+            return {
+                showStreamBot: true,
+                isStreamBotActive: false,
+                showStreamBotModal: false,
+                streamBotMeetUrl: '',
+                streamBotStatus: '',
+            };
+        },
+        methods: {
+            handleStreamBotClick() {
+                if (this.isStreamBotActive) {
+                    // Stop bot stream
+                    fetch('/stop_stream_ingest', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+                        .then(res => res.json())
+                        .then(data => {
+                            this.isStreamBotActive = false;
+                            this.streamBotStatus = 'Bot stream stopped.';
+                        })
+                        .catch(() => { this.streamBotStatus = 'Failed to stop bot stream.'; });
+                } else {
+                    this.showStreamBotModal = true;
+                }
+            },
+            submitStreamBot() {
+                // Start bot stream with meet URL
+                fetch('/start_stream_ingest', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ meet_url: this.streamBotMeetUrl })
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'started') {
+                        this.isStreamBotActive = true;
+                        this.streamBotStatus = 'Bot stream started.';
+                        this.showStreamBotModal = false;
+                    } else {
+                        this.streamBotStatus = data.error || 'Failed to start bot stream.';
+                    }
+                })
+                .catch(() => { this.streamBotStatus = 'Failed to start bot stream.'; });
+            },
+        },
+        mounted() {
+            // Optionally poll for bot status
+        }
+    }).mount('#app');
+    </script>
 </body>
 </html>
