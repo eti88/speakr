@@ -7,10 +7,10 @@ from urllib.parse import urlparse, urljoin
 try:
     from flask import Markup
 except ImportError:
-    from markupsafe import Markup # type: ignore
-from flask_sqlalchemy import SQLAlchemy # type: ignore
-from datetime import datetime
-from openai import OpenAI # Keep using the OpenAI library # type: ignore
+    from markupsafe import Markup
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime, timedelta
+from openai import OpenAI # Keep using the OpenAI library
 import json
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -425,6 +425,135 @@ def format_transcription_for_llm(transcription_text):
         # Not a JSON, or not the format we expect, so return as is.
         pass
     return transcription_text
+
+def clean_llm_response(text):
+    """
+    Clean LLM responses by removing thinking tags and excessive whitespace.
+    This handles responses from reasoning models that include <think> tags.
+    """
+    if not text:
+        return ""
+    
+    # Remove thinking tags and their content
+    # Handle both <think> and <thinking> tags with various closing formats
+    cleaned = re.sub(r'<think(?:ing)?>.*?</think(?:ing)?>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Also handle unclosed thinking tags (in case the model doesn't close them)
+    cleaned = re.sub(r'<think(?:ing)?>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove any remaining XML-like tags that might be related to thinking
+    # but preserve markdown formatting
+    cleaned = re.sub(r'<(?!/?(?:code|pre|blockquote|p|br|hr|ul|ol|li|h[1-6]|em|strong|b|i|a|img)(?:\s|>|/))[^>]+>', '', cleaned)
+    
+    # Clean up excessive whitespace while preserving intentional formatting
+    # Remove leading/trailing whitespace from each line
+    lines = cleaned.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Preserve lines that are part of code blocks or lists
+        if line.strip() or (len(cleaned_lines) > 0 and cleaned_lines[-1].strip().startswith(('```', '-', '*', '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.'))):
+            cleaned_lines.append(line.rstrip())
+    
+    # Join lines and remove multiple consecutive blank lines
+    cleaned = '\n'.join(cleaned_lines)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    # Final strip to remove leading/trailing whitespace
+    return cleaned.strip()
+
+def extract_thinking_content(text):
+    """
+    Extract thinking content from LLM responses.
+    Returns a tuple of (thinking_content, main_content).
+    """
+    if not text:
+        return ("", "")
+    
+    # Find all thinking tags and their content
+    thinking_pattern = r'<think(?:ing)?>.*?</think(?:ing)?>'
+    thinking_matches = re.findall(thinking_pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Extract the content from within the tags
+    thinking_content = ""
+    for match in thinking_matches:
+        # Remove the opening and closing tags
+        content = re.sub(r'^<think(?:ing)?>', '', match, flags=re.IGNORECASE)
+        content = re.sub(r'</think(?:ing)?>$', '', content, flags=re.IGNORECASE)
+        if thinking_content:
+            thinking_content += "\n\n"
+        thinking_content += content.strip()
+    
+    # Get the main content by removing thinking tags
+    main_content = clean_llm_response(text)
+    
+    return (thinking_content, main_content)
+
+def process_streaming_with_thinking(stream):
+    """
+    Generator that processes a streaming response and separates thinking content.
+    Yields SSE-formatted data with 'delta' for regular content and 'thinking' for thinking content.
+    """
+    content_buffer = ""
+    in_thinking = False
+    thinking_buffer = ""
+    
+    for chunk in stream:
+        content = chunk.choices[0].delta.content
+        if content:
+            content_buffer += content
+            
+            # Process the buffer to detect and handle thinking tags
+            while True:
+                if not in_thinking:
+                    # Look for opening thinking tag
+                    think_start = re.search(r'<think(?:ing)?>', content_buffer, re.IGNORECASE)
+                    if think_start:
+                        # Send any content before the thinking tag
+                        before_thinking = content_buffer[:think_start.start()]
+                        if before_thinking:
+                            yield f"data: {json.dumps({'delta': before_thinking})}\n\n"
+                        
+                        # Start capturing thinking content
+                        in_thinking = True
+                        content_buffer = content_buffer[think_start.end():]
+                        thinking_buffer = ""
+                    else:
+                        # No thinking tag found, send accumulated content
+                        if content_buffer:
+                            yield f"data: {json.dumps({'delta': content_buffer})}\n\n"
+                        content_buffer = ""
+                        break
+                else:
+                    # We're inside a thinking tag, look for closing tag
+                    think_end = re.search(r'</think(?:ing)?>', content_buffer, re.IGNORECASE)
+                    if think_end:
+                        # Capture thinking content up to the closing tag
+                        thinking_buffer += content_buffer[:think_end.start()]
+                        
+                        # Send the thinking content as a special type
+                        if thinking_buffer.strip():
+                            yield f"data: {json.dumps({'thinking': thinking_buffer.strip()})}\n\n"
+                        
+                        # Continue processing after the closing tag
+                        in_thinking = False
+                        content_buffer = content_buffer[think_end.end():]
+                        thinking_buffer = ""
+                    else:
+                        # Still inside thinking tag, accumulate content
+                        thinking_buffer += content_buffer
+                        content_buffer = ""
+                        break
+    
+    # Handle any remaining content
+    if in_thinking and thinking_buffer:
+        # Unclosed thinking tag - send as thinking content
+        yield f"data: {json.dumps({'thinking': thinking_buffer.strip()})}\n\n"
+    elif content_buffer:
+        # Regular content
+        yield f"data: {json.dumps({'delta': content_buffer})}\n\n"
+    
+    # Signal the end of the stream
+    yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
 
 app = Flask(__name__)
 # Use environment variables or default paths for Docker compatibility
@@ -1463,6 +1592,28 @@ with app.app_context():
             )
             app.logger.info("Initialized default max_file_size_mb setting")
         
+        if not SystemSetting.query.filter_by(key='asr_timeout_seconds').first():
+            SystemSetting.set_setting(
+                key='asr_timeout_seconds',
+                value='1800',
+                description='Maximum time in seconds to wait for ASR transcription to complete. Default is 1800 seconds (30 minutes).',
+                setting_type='integer'
+            )
+            app.logger.info("Initialized default asr_timeout_seconds setting")
+        
+        if not SystemSetting.query.filter_by(key='admin_default_summary_prompt').first():
+            default_prompt = """Generate a comprehensive summary that includes the following sections:
+- **Key Issues Discussed**: A bulleted list of the main topics
+- **Key Decisions Made**: A bulleted list of any decisions reached
+- **Action Items**: A bulleted list of tasks assigned, including who is responsible if mentioned"""
+            SystemSetting.set_setting(
+                key='admin_default_summary_prompt',
+                value=default_prompt,
+                description='Default summarization prompt used when users have not set their own prompt. This serves as the base prompt for all users.',
+                setting_type='string'
+            )
+            app.logger.info("Initialized admin_default_summary_prompt setting")
+        
         # Process existing recordings for inquire mode (chunk and embed them)
         # Only run if inquire mode is enabled
         if ENABLE_INQUIRE_MODE:
@@ -1530,7 +1681,17 @@ TEXT_MODEL_API_KEY = os.environ.get("TEXT_MODEL_API_KEY")
 TEXT_MODEL_BASE_URL = os.environ.get("TEXT_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
 TEXT_MODEL_NAME = os.environ.get("TEXT_MODEL_NAME", "openai/gpt-3.5-turbo") # Default if not set
 
-http_client_no_proxy = httpx.Client(verify=True) # verify=True is default, but good to be explicit
+# Set up HTTP client with custom headers for OpenRouter app identification
+app_headers = {
+    "HTTP-Referer": "https://github.com/murtaza-nasir/speakr",  # Your app's repo URL for OpenRouter visibility
+    "X-Title": "Speakr - AI Audio Transcription",  # Your app name for OpenRouter visibility
+    "User-Agent": "Speakr/1.0 (https://github.com/murtaza-nasir/speakr)"  # Custom user agent for better tracking
+}
+
+http_client_no_proxy = httpx.Client(
+    verify=True,
+    headers=app_headers
+)
 
 try:
     # Always attempt to create client - use API key if provided, otherwise use placeholder
@@ -1541,9 +1702,51 @@ try:
         http_client=http_client_no_proxy
     )
     app.logger.info(f"LLM client initialized for endpoint: {TEXT_MODEL_BASE_URL}. Using model: {TEXT_MODEL_NAME}")
+    if "openrouter" in TEXT_MODEL_BASE_URL.lower():
+        app.logger.info("OpenRouter integration: App identification headers added for visibility in logs")
 except Exception as client_init_e:
     app.logger.error(f"Failed to initialize LLM client: {client_init_e}", exc_info=True)
     client = None
+
+def call_llm_completion(messages, temperature=0.7, response_format=None, stream=False, max_tokens=None):
+    """
+    Centralized function for LLM API calls with proper error handling and logging.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        temperature: Sampling temperature (0-1)
+        response_format: Optional response format dict (e.g., {"type": "json_object"})
+        stream: Whether to stream the response
+        max_tokens: Optional maximum tokens to generate
+        
+    Returns:
+        OpenAI completion object or generator (if streaming)
+    """
+    if not client:
+        raise ValueError("LLM client not initialized")
+    
+    if not TEXT_MODEL_API_KEY:
+        raise ValueError("TEXT_MODEL_API_KEY not configured")
+    
+    try:
+        completion_args = {
+            "model": TEXT_MODEL_NAME,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": stream
+        }
+        
+        if response_format:
+            completion_args["response_format"] = response_format
+            
+        if max_tokens:
+            completion_args["max_tokens"] = max_tokens
+            
+        return client.chat.completions.create(**completion_args)
+        
+    except Exception as e:
+        app.logger.error(f"LLM API call failed: {e}")
+        raise
 
 # Store details for the transcription client (potentially different)
 transcription_api_key = os.environ.get("TRANSCRIPTION_API_KEY", "cant-be-empty")
@@ -1698,8 +1901,7 @@ Title:"""
         
             
         try:
-            completion = client.chat.completions.create(
-                model=TEXT_MODEL_NAME,
+            completion = call_llm_completion(
                 messages=[
                     {"role": "system", "content": system_message_content},
                     {"role": "user", "content": prompt_text}
@@ -1724,7 +1926,7 @@ Title:"""
                         raw_response = line
                         break
             
-            title = raw_response.strip() if raw_response else ""
+            title = clean_llm_response(raw_response) if raw_response else ""
             
             if title:
                 recording.title = title
@@ -1803,14 +2005,13 @@ def generate_summary_only_task(app_context, recording_id):
                 tag_custom_prompt = tag_custom_prompts[0]['prompt']
                 app.logger.info(f"Using single custom prompt from tag '{tag_custom_prompts[0]['name']}' for recording {recording_id}")
             else:
-                # Merge multiple prompts with clear separation, preserving the order tags were added
+                # Merge multiple prompts seamlessly as unified instructions
                 merged_parts = []
-                for i, tag_prompt in enumerate(tag_custom_prompts, 1):
-                    ordinal = {1: '1st', 2: '2nd', 3: '3rd'}.get(i, f'{i}th')
-                    merged_parts.append(f"{i}. From tag '{tag_prompt['name']}' (added {ordinal}):\n{tag_prompt['prompt']}")
+                for tag_prompt in tag_custom_prompts:
+                    merged_parts.append(tag_prompt['prompt'])
                 tag_custom_prompt = "\n\n".join(merged_parts)
                 tag_names = [tp['name'] for tp in tag_custom_prompts]
-                app.logger.info(f"Merged custom prompts from {len(tag_custom_prompts)} tags in order added ({', '.join(tag_names)}) for recording {recording_id}")
+                app.logger.info(f"Combined custom prompts from {len(tag_custom_prompts)} tags in order added ({', '.join(tag_names)}) for recording {recording_id}")
         else:
             tag_custom_prompt = None
         
@@ -1830,58 +2031,70 @@ def generate_summary_only_task(app_context, recording_id):
         
         language_directive = f"Please provide the summary in {user_output_language}." if user_output_language else ""
         
-        # Priority order: tag custom prompt > user summary prompt > default prompt
-        if tag_custom_prompt:
-            app.logger.info(f"Using tag custom prompt for recording {recording_id}")
-            prompt_text = f"""Analyze the following audio transcription and generate a summary according to the following instructions.
-
-Instructions: {tag_custom_prompt}
-
-Transcription:
-\"\"\"
-{transcript_text}
-\"\"\"
-
-{language_directive}
-
-Respond with only the summary in Markdown format. Do NOT wrap your response in markdown code blocks (```markdown). Provide the markdown content directly without any code block formatting."""
-            
-        elif user_summary_prompt:
-            app.logger.info(f"Using user custom prompt for recording {recording_id}")
-            prompt_text = f"""Analyze the following audio transcription and generate a summary according to the following instructions.
-
-Instructions: {user_summary_prompt}
-
-Transcription:
-\"\"\"
-{transcript_text}
-\"\"\"
-
-{language_directive}
-
-Respond with only the summary in Markdown format. Do NOT wrap your response in markdown code blocks (```markdown). Provide the markdown content directly without any code block formatting."""
-            
-        else:
-            # Default summary prompt
-            prompt_text = f"""Analyze the following audio transcription and generate a detailed, well-structured summary in Markdown format.
-
-Transcription:
-\"\"\"
-{transcript_text}
-\"\"\"
-
-Generate a comprehensive summary that includes the following sections:
-- **Key Issues Discussed**: A bulleted list of the main topics
-- **Key Decisions Made**: A bulleted list of any decisions reached
-- **Action Items**: A bulleted list of tasks assigned, including who is responsible if mentioned
-
-{language_directive}
-
-Respond with only the summary in Markdown format. Do NOT wrap your response in markdown code blocks (```markdown). Provide the markdown content directly without any code block formatting."""
-
+        # Build system message with summarization instructions
         system_message_content = "You are an AI assistant that generates comprehensive summaries for meeting transcripts. Respond only with the summary in Markdown format. Do NOT use markdown code blocks (```markdown). Provide raw markdown content directly."
         if user_output_language:
             system_message_content += f" Ensure your response is in {user_output_language}."
+        
+        # Add summarization instructions to system message
+        # Priority order: tag custom prompt > user summary prompt > admin default prompt > hardcoded fallback
+        if tag_custom_prompt:
+            app.logger.info(f"Using tag custom prompt for recording {recording_id}")
+            system_message_content += f"\n\nSummarization Instructions:\n{tag_custom_prompt}"
+        elif user_summary_prompt:
+            app.logger.info(f"Using user custom prompt for recording {recording_id}")
+            system_message_content += f"\n\nSummarization Instructions:\n{user_summary_prompt}"
+        else:
+            # Get admin default prompt from system settings
+            admin_default_prompt = SystemSetting.get_setting('admin_default_summary_prompt', None)
+            if admin_default_prompt:
+                app.logger.info(f"Using admin default prompt for recording {recording_id}")
+                system_message_content += f"\n\nSummarization Instructions:\n{admin_default_prompt}"
+            else:
+                # Fallback to hardcoded default if admin hasn't set one
+                default_instructions = """Generate a comprehensive summary that includes the following sections:
+- **Key Issues Discussed**: A bulleted list of the main topics
+- **Key Decisions Made**: A bulleted list of any decisions reached
+- **Action Items**: A bulleted list of tasks assigned, including who is responsible if mentioned"""
+                app.logger.info(f"Using hardcoded default prompt for recording {recording_id}")
+                system_message_content += f"\n\nSummarization Instructions:\n{default_instructions}"
+        
+        # Build user prompt with context information
+        current_date = datetime.now().strftime("%B %d, %Y")
+        
+        # Build context information
+        context_parts = []
+        context_parts.append(f"Current date: {current_date}")
+        
+        # Add selected tags information
+        if recording.tags:
+            tag_names = [tag.name for tag in recording.tags]
+            context_parts.append(f"Tags applied to this transcript by the user: {', '.join(tag_names)}")
+        
+        # Add user profile information if available
+        if recording.owner:
+            user_context_parts = []
+            if recording.owner.name:
+                user_context_parts.append(f"Name: {recording.owner.name}")
+            if recording.owner.job_title:
+                user_context_parts.append(f"Job title: {recording.owner.job_title}")
+            if recording.owner.company:
+                user_context_parts.append(f"Company: {recording.owner.company}")
+            
+            if user_context_parts:
+                context_parts.append(f"Information about the user: {', '.join(user_context_parts)}")
+        
+        # Combine context and transcript
+        context_section = "Context:\n" + "\n".join(f"- {part}" for part in context_parts)
+        
+        prompt_text = f"""{context_section}
+
+Transcription:
+\"\"\"
+{transcript_text}
+\"\"\"
+
+Please analyze the above transcription and generate a summary following the provided instructions."""
             
         # Debug logging: Log the complete prompt being sent to the LLM
         app.logger.info(f"Sending summarization prompt to LLM (length: {len(prompt_text)} chars). Set LOG_LEVEL=DEBUG to see full prompt details.")
@@ -1891,8 +2104,7 @@ Respond with only the summary in Markdown format. Do NOT wrap your response in m
         app.logger.debug(f"=== END SUMMARIZATION DEBUG for recording {recording_id} ===")
             
         try:
-            completion = client.chat.completions.create(
-                model=TEXT_MODEL_NAME,
+            completion = call_llm_completion(
                 messages=[
                     {"role": "system", "content": system_message_content},
                     {"role": "user", "content": prompt_text}
@@ -1904,7 +2116,7 @@ Respond with only the summary in Markdown format. Do NOT wrap your response in m
             raw_response = completion.choices[0].message.content
             app.logger.info(f"Raw LLM response for recording {recording_id}: '{raw_response}'")
             
-            summary = raw_response.strip() if raw_response else ""
+            summary = clean_llm_response(raw_response) if raw_response else ""
             app.logger.info(f"Processed summary length for recording {recording_id}: {len(summary)} characters")
             
             if summary:
@@ -1926,8 +2138,12 @@ Respond with only the summary in Markdown format. Do NOT wrap your response in m
             recording.status = 'FAILED'
             db.session.commit()
 
-def extract_audio_from_video(video_filepath, output_format='wav', cleanup_original=True):
-    """Extract audio from video containers using FFmpeg."""
+def extract_audio_from_video(video_filepath, output_format='mp3', cleanup_original=True):
+    """Extract audio from video containers using FFmpeg.
+    
+    Uses MP3 codec for optimal compatibility and predictable file sizes.
+    64kbps MP3 provides good speech quality at ~480KB per minute.
+    """
     try:
         # Generate output filename with audio extension
         base_filepath, file_ext = os.path.splitext(video_filepath)
@@ -1936,17 +2152,25 @@ def extract_audio_from_video(video_filepath, output_format='wav', cleanup_origin
         
         app.logger.info(f"Extracting audio from video: {video_filepath} -> {temp_audio_filepath}")
         
-        # Extract audio using FFmpeg - optimized for transcription
+        # Extract audio using FFmpeg - using MP3 for consistency with chunking
         subprocess.run([
             'ffmpeg', '-i', video_filepath, '-y',
             '-vn',  # No video
-            '-acodec', 'pcm_s16le',  # Uncompressed audio for best quality
-            '-ar', '16000',  # 16kHz sample rate (good for speech)
-            '-ac', '1',  # Mono
+            '-codec:a', 'libmp3lame',  # Use LAME MP3 encoder explicitly
+            '-b:a', '64k',  # 64kbps bitrate (better quality than chunking's 32k, still small)
+            '-ar', '22050',  # 22.05kHz sample rate (good for speech, better than 16kHz)
+            '-ac', '1',  # Mono (sufficient for speech, reduces file size)
+            '-compression_level', '2',  # Better compression
             temp_audio_filepath
         ], check=True, capture_output=True, text=True)
         
         app.logger.info(f"Successfully extracted audio to {temp_audio_filepath}")
+        
+        # Optionally preserve temp file for debugging (set PRESERVE_TEMP_AUDIO=true in env)
+        if os.getenv('PRESERVE_TEMP_AUDIO', 'false').lower() == 'true':
+            import shutil
+            shutil.copy2(temp_audio_filepath, temp_audio_filepath.replace('_temp', '_debug'))
+            app.logger.info(f"Debug: Preserved temp audio file as {temp_audio_filepath.replace('_temp', '_debug')}")
         
         # Rename temp file to final filename
         os.rename(temp_audio_filepath, final_audio_filepath)
@@ -2006,7 +2230,7 @@ def transcribe_audio_asr(app_context, recording_id, filepath, original_filename,
                 app.logger.info(f"Video container detected ({actual_content_type}), extracting audio...")
                 try:
                     # Extract audio from video
-                    audio_filepath, audio_mime_type = extract_audio_from_video(filepath, 'wav')
+                    audio_filepath, audio_mime_type = extract_audio_from_video(filepath, 'mp3')
                     
                     # Update paths and MIME type for ASR processing
                     actual_filepath = audio_filepath
@@ -2026,108 +2250,168 @@ def transcribe_audio_asr(app_context, recording_id, filepath, original_filename,
                     db.session.commit()
                     return
 
-            with open(actual_filepath, 'rb') as audio_file:
-                url = f"{ASR_BASE_URL}/asr"
-                params = {
-                    'encode': True,
-                    'task': 'transcribe',
-                    'output': 'json'
-                }
-                if language:
-                    params['language'] = language
-                if diarize:
-                    params['diarize'] = diarize
-                if min_speakers:
-                    params['min_speakers'] = min_speakers
-                if max_speakers:
-                    params['max_speakers'] = max_speakers
+            # Keep track of whether we've already tried WAV conversion
+            wav_conversion_attempted = False
+            wav_converted_filepath = None
+            
+            # Retry loop for handling 500 errors with WAV conversion
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                try:
+                    # Use converted WAV if available from previous attempt
+                    current_filepath = wav_converted_filepath if wav_converted_filepath else actual_filepath
+                    current_content_type = 'audio/x-wav' if wav_converted_filepath else actual_content_type
+                    current_filename = os.path.basename(current_filepath)
+                    
+                    with open(current_filepath, 'rb') as audio_file:
+                        url = f"{ASR_BASE_URL}/asr"
+                        params = {
+                            'encode': True,
+                            'task': 'transcribe',
+                            'output': 'json'
+                        }
+                        if language:
+                            params['language'] = language
+                        if diarize:
+                            params['diarize'] = diarize
+                        if min_speakers:
+                            params['min_speakers'] = min_speakers
+                        if max_speakers:
+                            params['max_speakers'] = max_speakers
 
-                content_type = actual_content_type
-                app.logger.info(f"Using MIME type {content_type} for ASR upload.")
-                files = {'audio_file': (actual_filename, audio_file, content_type)}
-                
-                with httpx.Client() as client:
-                    # Set reasonable timeout to prevent hanging (30 minutes max)
-                    timeout = httpx.Timeout(None, connect=30.0, read=1800.0, write=30.0, pool=30.0)
-                    app.logger.info(f"Sending ASR request to {url} with params: {params}")
-                    response = client.post(url, params=params, files=files, timeout=timeout)
-                    app.logger.info(f"ASR request completed with status: {response.status_code}")
-                    response.raise_for_status()
+                        content_type = current_content_type
+                        app.logger.info(f"Using MIME type {content_type} for ASR upload.")
+                        files = {'audio_file': (current_filename, audio_file, content_type)}
+                        
+                        with httpx.Client() as client:
+                            # Get configurable ASR timeout from database (default 30 minutes)
+                            asr_timeout_seconds = SystemSetting.get_setting('asr_timeout_seconds', 1800)
+                            timeout = httpx.Timeout(None, connect=30.0, read=float(asr_timeout_seconds), write=30.0, pool=30.0)
+                            app.logger.info(f"Sending ASR request to {url} with params: {params} (timeout: {asr_timeout_seconds}s)")
+                            response = client.post(url, params=params, files=files, timeout=timeout)
+                            app.logger.info(f"ASR request completed with status: {response.status_code}")
+                            response.raise_for_status()
+                            
+                            # Parse the JSON response from ASR (moved here so it's accessible)
+                            asr_response_data = response.json()
                     
-                    # Parse the JSON response from ASR
-                    asr_response_data = response.json()
+                    # If we reach here, the request was successful
+                    break
                     
-                    # Debug logging for ASR response
-                    app.logger.info(f"ASR response keys: {list(asr_response_data.keys())}")
-                    
-                    # Log the complete raw JSON response (truncated for readability)
-                    import json as json_module
-                    raw_json_str = json_module.dumps(asr_response_data, indent=2)
-                    if len(raw_json_str) > 5000:
-                        app.logger.info(f"Raw ASR response (first 5000 chars): {raw_json_str[:5000]}...")
+                except httpx.HTTPStatusError as e:
+                    # Check if it's a 500 error and we haven't tried WAV conversion yet
+                    if e.response.status_code == 500 and attempt == 0 and not wav_conversion_attempted:
+                        app.logger.warning(f"ASR returned 500 error for recording {recording_id}, attempting WAV conversion and retry...")
+                        
+                        # Convert to WAV using same parameters as reprocessing
+                        filename_lower = actual_filename.lower()
+                        if not filename_lower.endswith('.wav'):
+                            try:
+                                base_filepath, file_ext = os.path.splitext(actual_filepath)
+                                temp_wav_filepath = f"{base_filepath}_temp.wav"
+                                
+                                app.logger.info(f"Converting {actual_filename} to WAV format for retry...")
+                                subprocess.run(
+                                    ['ffmpeg', '-i', actual_filepath, '-y', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav_filepath],
+                                    check=True, capture_output=True, text=True
+                                )
+                                app.logger.info(f"Successfully converted {actual_filepath} to {temp_wav_filepath}")
+                                
+                                wav_converted_filepath = temp_wav_filepath
+                                wav_conversion_attempted = True
+                                # Continue to next iteration to retry with WAV
+                                continue
+                            except subprocess.CalledProcessError as conv_error:
+                                app.logger.error(f"Failed to convert to WAV: {conv_error}")
+                                # Re-raise the original HTTP error if conversion fails
+                                raise e
+                        else:
+                            # Already a WAV file, can't convert further
+                            app.logger.error(f"File is already WAV but still getting 500 error")
+                            raise e
                     else:
-                        app.logger.info(f"Raw ASR response: {raw_json_str}")
+                        # Not a 500 error or already tried conversion, propagate the error
+                        raise e
+            
+            # Clean up temporary WAV file if created
+            try:
+                if wav_converted_filepath and os.path.exists(wav_converted_filepath):
+                    os.remove(wav_converted_filepath)
+                    app.logger.info(f"Cleaned up temporary WAV file: {wav_converted_filepath}")
+            except Exception as cleanup_error:
+                app.logger.warning(f"Failed to clean up temporary WAV file: {cleanup_error}")
+            
+            # Debug logging for ASR response
+            app.logger.info(f"ASR response keys: {list(asr_response_data.keys())}")
+            
+            # Log the complete raw JSON response (truncated for readability)
+            import json as json_module
+            raw_json_str = json_module.dumps(asr_response_data, indent=2)
+            if len(raw_json_str) > 5000:
+                app.logger.info(f"Raw ASR response (first 5000 chars): {raw_json_str[:5000]}...")
+            else:
+                app.logger.info(f"Raw ASR response: {raw_json_str}")
+            
+            if 'segments' in asr_response_data:
+                app.logger.info(f"Number of segments: {len(asr_response_data['segments'])}")
+                
+                # Collect all unique speakers from the response
+                all_speakers = set()
+                segments_with_speakers = 0
+                segments_without_speakers = 0
+                
+                for segment in asr_response_data['segments']:
+                    if 'speaker' in segment and segment['speaker'] is not None:
+                        all_speakers.add(segment['speaker'])
+                        segments_with_speakers += 1
+                    else:
+                        segments_without_speakers += 1
+                
+                app.logger.info(f"Unique speakers found in raw response: {sorted(list(all_speakers))}")
+                app.logger.info(f"Segments with speakers: {segments_with_speakers}, without speakers: {segments_without_speakers}")
+                
+                # Log first few segments for debugging
+                for i, segment in enumerate(asr_response_data['segments'][:5]):
+                    segment_keys = list(segment.keys())
+                    app.logger.info(f"Segment {i} keys: {segment_keys}")
+                    app.logger.info(f"Segment {i}: speaker='{segment.get('speaker')}', text='{segment.get('text', '')[:50]}...'")
+            
+            # Simplify the JSON data
+            simplified_segments = []
+            if 'segments' in asr_response_data and isinstance(asr_response_data['segments'], list):
+                last_known_speaker = None
+                
+                for i, segment in enumerate(asr_response_data['segments']):
+                    speaker = segment.get('speaker')
+                    text = segment.get('text', '').strip()
                     
-                    if 'segments' in asr_response_data:
-                        app.logger.info(f"Number of segments: {len(asr_response_data['segments'])}")
-                        
-                        # Collect all unique speakers from the response
-                        all_speakers = set()
-                        segments_with_speakers = 0
-                        segments_without_speakers = 0
-                        
-                        for segment in asr_response_data['segments']:
-                            if 'speaker' in segment and segment['speaker'] is not None:
-                                all_speakers.add(segment['speaker'])
-                                segments_with_speakers += 1
-                            else:
-                                segments_without_speakers += 1
-                        
-                        app.logger.info(f"Unique speakers found in raw response: {sorted(list(all_speakers))}")
-                        app.logger.info(f"Segments with speakers: {segments_with_speakers}, without speakers: {segments_without_speakers}")
-                        
-                        # Log first few segments for debugging
-                        for i, segment in enumerate(asr_response_data['segments'][:5]):
-                            segment_keys = list(segment.keys())
-                            app.logger.info(f"Segment {i} keys: {segment_keys}")
-                            app.logger.info(f"Segment {i}: speaker='{segment.get('speaker')}', text='{segment.get('text', '')[:50]}...'")
+                    # If segment doesn't have a speaker, use the previous segment's speaker
+                    if speaker is None:
+                        if last_known_speaker is not None:
+                            speaker = last_known_speaker
+                            app.logger.info(f"Assigned speaker '{speaker}' to segment {i} from previous segment")
+                        else:
+                            speaker = 'UNKNOWN_SPEAKER'
+                            app.logger.warning(f"No previous speaker available for segment {i}, using UNKNOWN_SPEAKER")
+                    else:
+                        # Update the last known speaker when we have a valid one
+                        last_known_speaker = speaker
                     
-                    # Simplify the JSON data
-                    simplified_segments = []
-                    if 'segments' in asr_response_data and isinstance(asr_response_data['segments'], list):
-                        last_known_speaker = None
-                        
-                        for i, segment in enumerate(asr_response_data['segments']):
-                            speaker = segment.get('speaker')
-                            text = segment.get('text', '').strip()
-                            
-                            # If segment doesn't have a speaker, use the previous segment's speaker
-                            if speaker is None:
-                                if last_known_speaker is not None:
-                                    speaker = last_known_speaker
-                                    app.logger.info(f"Assigned speaker '{speaker}' to segment {i} from previous segment")
-                                else:
-                                    speaker = 'UNKNOWN_SPEAKER'
-                                    app.logger.warning(f"No previous speaker available for segment {i}, using UNKNOWN_SPEAKER")
-                            else:
-                                # Update the last known speaker when we have a valid one
-                                last_known_speaker = speaker
-                            
-                            simplified_segments.append({
-                                'speaker': speaker,
-                                'sentence': text,
-                                'start_time': segment.get('start'),
-                                'end_time': segment.get('end')
-                            })
-                    
-                    # Log final simplified segments count
-                    app.logger.info(f"Created {len(simplified_segments)} simplified segments")
-                    null_speaker_count = sum(1 for seg in simplified_segments if seg['speaker'] is None)
-                    if null_speaker_count > 0:
-                        app.logger.warning(f"Found {null_speaker_count} segments with null speakers in final output")
-                    
-                    # Store the simplified JSON as a string
-                    recording.transcription = json.dumps(simplified_segments)
+                    simplified_segments.append({
+                        'speaker': speaker,
+                        'sentence': text,
+                        'start_time': segment.get('start'),
+                        'end_time': segment.get('end')
+                    })
+            
+            # Log final simplified segments count
+            app.logger.info(f"Created {len(simplified_segments)} simplified segments")
+            null_speaker_count = sum(1 for seg in simplified_segments if seg['speaker'] is None)
+            if null_speaker_count > 0:
+                app.logger.warning(f"Found {null_speaker_count} segments with null speakers in final output")
+            
+            # Store the simplified JSON as a string
+            recording.transcription = json.dumps(simplified_segments)
             
             # Commit the transcription data
             db.session.commit()
@@ -2136,25 +2420,28 @@ def transcribe_audio_asr(app_context, recording_id, filepath, original_filename,
             # Generate title immediately
             generate_title_task(app_context, recording_id)
             
-            # Only auto-generate summary if recording has a tag with custom prompt
-            should_auto_summarize = False
-            if recording.tags:
-                for tag in recording.tags:
-                    if tag.custom_prompt:
-                        should_auto_summarize = True
-                        app.logger.info(f"Auto-generating summary for recording {recording_id} due to tag '{tag.name}' with custom prompt")
-                        break
-            
-            if should_auto_summarize:
-                generate_summary_only_task(app_context, recording_id)
+            # Always auto-generate summary for all recordings
+            app.logger.info(f"Auto-generating summary for recording {recording_id}")
+            generate_summary_only_task(app_context, recording_id)
 
         except Exception as e:
             db.session.rollback()
-            app.logger.error(f"ASR processing FAILED for recording {recording_id}: {str(e)}", exc_info=True)
+            
+            # Handle timeout errors specifically
+            error_msg = str(e)
+            if "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
+                asr_timeout = SystemSetting.get_setting('asr_timeout_seconds', 1800)
+                app.logger.error(f"ASR processing TIMED OUT for recording {recording_id} after {asr_timeout} seconds. Consider increasing 'asr_timeout_seconds' in Admin Dashboard > System Settings.")
+                user_error_msg = f"ASR processing timed out after {asr_timeout} seconds. The file may be too long for the current timeout setting."
+            else:
+                # For non-timeout errors, include more detail
+                app.logger.error(f"ASR processing FAILED for recording {recording_id}: {error_msg}")
+                user_error_msg = f"ASR processing failed: {error_msg}"
+            
             recording = db.session.get(Recording, recording_id)
             if recording:
                 recording.status = 'FAILED'
-                recording.transcription = f"ASR processing failed: {str(e)}"
+                recording.transcription = user_error_msg
                 db.session.commit()
 
 def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr, start_time, language=None, min_speakers=None, max_speakers=None, tag_id=None):
@@ -2239,17 +2526,9 @@ def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr,
             # Generate title immediately
             generate_title_task(app_context, recording_id)
             
-            # Only auto-generate summary if recording has a tag with custom prompt
-            should_auto_summarize = False
-            if recording.tags:
-                for tag in recording.tags:
-                    if tag.custom_prompt:
-                        should_auto_summarize = True
-                        app.logger.info(f"Auto-generating summary for recording {recording_id} due to tag '{tag.name}' with custom prompt")
-                        break
-            
-            if should_auto_summarize:
-                generate_summary_only_task(app_context, recording_id)
+            # Always auto-generate summary for all recordings
+            app.logger.info(f"Auto-generating summary for recording {recording_id}")
+            generate_summary_only_task(app_context, recording_id)
 
         except Exception as e:
             db.session.rollback() # Rollback if any step failed critically
@@ -2733,6 +3012,160 @@ def download_summary_word(recording_id):
         app.logger.error(f"Error generating summary Word document: {e}")
         return jsonify({'error': 'Failed to generate Word document'}), 500
 
+@app.route('/recording/<int:recording_id>/download/chat', methods=['POST'])
+@login_required
+def download_chat_word(recording_id):
+    """Download chat conversation as a Word document."""
+    try:
+        from docx import Document
+        from docx.shared import Inches
+        import re
+        from io import BytesIO
+        
+        recording = db.session.get(Recording, recording_id)
+        if not recording:
+            return jsonify({'error': 'Recording not found'}), 404
+            
+        # Check if the recording belongs to the current user
+        if recording.user_id and recording.user_id != current_user.id:
+            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        
+        # Get chat messages from request
+        data = request.json
+        if not data or 'messages' not in data:
+            return jsonify({'error': 'No messages provided'}), 400
+        
+        messages = data['messages']
+        if not messages:
+            return jsonify({'error': 'No messages to download'}), 400
+        
+        # Create Word document
+        doc = Document()
+        
+        # Add title
+        title = doc.add_heading(f'Chat Conversation: {recording.title or "Untitled Recording"}', 0)
+        
+        # Add metadata
+        doc.add_paragraph(f'Recording Date: {recording.created_at.strftime("%Y-%m-%d %H:%M")}')
+        doc.add_paragraph(f'Chat Export Date: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")}')
+        doc.add_paragraph('')  # Empty line
+        
+        # Add chat messages
+        for message in messages:
+            role = message.get('role', 'unknown')
+            content = message.get('content', '')
+            thinking = message.get('thinking', '')
+            
+            # Add role header
+            if role == 'user':
+                p = doc.add_paragraph()
+                p.add_run('You: ').bold = True
+            elif role == 'assistant':
+                p = doc.add_paragraph()
+                p.add_run('Assistant: ').bold = True
+            else:
+                p = doc.add_paragraph()
+                p.add_run(f'{role.title()}: ').bold = True
+            
+            # Add thinking content if present
+            if thinking and role == 'assistant':
+                p = doc.add_paragraph()
+                p.add_run('[Model Reasoning]\n').italic = True
+                p.add_run(thinking).italic = True
+                doc.add_paragraph('')  # Empty line
+            
+            # Add message content
+            # Convert markdown-like formatting
+            lines = content.split('\n')
+            current_paragraph = None
+            
+            for line in lines:
+                if line.startswith('# '):
+                    # Heading
+                    doc.add_heading(line[2:], level=1)
+                    current_paragraph = None
+                elif line.startswith('## '):
+                    # Subheading
+                    doc.add_heading(line[3:], level=2)
+                    current_paragraph = None
+                elif line.startswith('### '):
+                    # Sub-subheading
+                    doc.add_heading(line[4:], level=3)
+                    current_paragraph = None
+                elif line.startswith('- ') or line.startswith('* '):
+                    # Bullet point
+                    p = doc.add_paragraph(style='List Bullet')
+                    # Handle bold text
+                    text = line[2:]
+                    bold_pattern = r'\*\*(.*?)\*\*'
+                    parts = re.split(bold_pattern, text)
+                    for i, part in enumerate(parts):
+                        if i % 2 == 0:  # Regular text
+                            if part:
+                                p.add_run(part)
+                        else:  # Bold text
+                            if part:
+                                p.add_run(part).bold = True
+                    current_paragraph = None
+                elif re.match(r'^\d+\.', line):
+                    # Numbered list
+                    p = doc.add_paragraph(style='List Number')
+                    text = re.sub(r'^\d+\.\s*', '', line)
+                    # Handle bold text
+                    bold_pattern = r'\*\*(.*?)\*\*'
+                    parts = re.split(bold_pattern, text)
+                    for i, part in enumerate(parts):
+                        if i % 2 == 0:  # Regular text
+                            if part:
+                                p.add_run(part)
+                        else:  # Bold text
+                            if part:
+                                p.add_run(part).bold = True
+                    current_paragraph = None
+                else:
+                    # Regular paragraph
+                    if current_paragraph is None:
+                        current_paragraph = doc.add_paragraph()
+                    else:
+                        current_paragraph.add_run('\n')
+                    
+                    # Handle bold text
+                    bold_pattern = r'\*\*(.*?)\*\*'
+                    parts = re.split(bold_pattern, line)
+                    for i, part in enumerate(parts):
+                        if i % 2 == 0:  # Regular text
+                            if part:
+                                current_paragraph.add_run(part)
+                        else:  # Bold text
+                            if part:
+                                current_paragraph.add_run(part).bold = True
+            
+            doc.add_paragraph('')  # Empty line between messages
+        
+        # Save to BytesIO
+        doc_stream = BytesIO()
+        doc.save(doc_stream)
+        doc_stream.seek(0)
+        
+        # Create safe filename
+        safe_title = re.sub(r'[^\w\s-]', '', recording.title or 'Untitled')
+        safe_title = re.sub(r'[-\s]+', '-', safe_title).strip('-')
+        filename = f'chat-{safe_title}.docx' if safe_title else f'chat-recording-{recording_id}.docx'
+        
+        response = send_file(
+            doc_stream,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+        
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+        
+    except Exception as e:
+        app.logger.error(f"Error generating chat Word document: {e}")
+        return jsonify({'error': 'Failed to generate Word document'}), 500
+
 @app.route('/recording/<int:recording_id>/download/notes')
 @login_required  
 def download_notes_word(recording_id):
@@ -3068,8 +3501,7 @@ JSON Response:
 """
 
     try:
-        completion = client.chat.completions.create(
-            model=TEXT_MODEL_NAME,
+        completion = call_llm_completion(
             messages=[
                 {"role": "system", "content": "You are an expert in analyzing conversation transcripts to identify speakers. Your response must be a single, valid JSON object."},
                 {"role": "user", "content": prompt}
@@ -3140,8 +3572,7 @@ JSON Response:
 """
 
     try:
-        completion = client.chat.completions.create(
-            model=TEXT_MODEL_NAME,
+        completion = call_llm_completion(
             messages=[
                 {"role": "system", "content": "You are an expert in analyzing conversation transcripts to identify speakers based on contextual clues in the dialogue. Analyze the conversation carefully to find names mentioned when speakers address each other or introduce themselves. Your response must be a single, valid JSON object containing only the requested speaker identifications."},
                 {"role": "user", "content": prompt}
@@ -3290,22 +3721,16 @@ Additional context and notes about the meeting:
         def generate():
             try:
                 # Enable streaming
-                stream = client.chat.completions.create(
-                    model=TEXT_MODEL_NAME,
+                stream = call_llm_completion(
                     messages=messages,
                     temperature=0.7,
                     max_tokens=int(os.environ.get("CHAT_MAX_TOKENS", "2000")),
                     stream=True
                 )
                 
-                for chunk in stream:
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        # Yield the content in SSE format
-                        yield f"data: {json.dumps({'delta': content})}\n\n"
-                
-                # Signal the end of the stream
-                yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
+                # Use helper function to process streaming with thinking tag support
+                for response in process_streaming_with_thinking(stream):
+                    yield response
 
             except Exception as e:
                 app.logger.error(f"Error during chat stream generation: {str(e)}")
@@ -3502,216 +3927,8 @@ def reprocess_summary(recording_id):
         
         # Start summary generation in background thread
         def reprocess_summary_task(app_context, recording_id):
-            with app_context:
-                recording = db.session.get(Recording, recording_id)
-                if not recording:
-                    app.logger.error(f"Recording {recording_id} not found during summary reprocessing")
-                    return
-                    
-                try:
-                    # Get user preferences
-                    user_summary_prompt = None
-                    user_output_language = None
-                    if recording.owner:
-                        user_summary_prompt = recording.owner.summary_prompt
-                        user_output_language = recording.owner.output_language
-                    
-                    # Prepare prompt (same logic as in transcribe_audio_task)
-                    default_summary_prompt = """Analyze the following audio transcription and generate a concise title and a brief summary.
-
-Transcription:
-\"\"\"
-{transcription}
-\"\"\"
-
-Respond STRICTLY with a JSON object containing two keys: "title" (a short, descriptive title, max 6 words without using words introductory words and phrases like brief, "discussion on", "Meeting about" etc.) and "minutes" (a paragraph summarizing the key points, max 150 words). The title should get to the point without inroductory phrases as we have very little space to show the title.
-{language_directive}
-Example Format:
-{{
-  "title": "Q3 Results for SPERO Program",
-  "summary": "### Minutes
-
-**Meeting Participants:**  
-- Bob  
-- Alice  
-
----
-
-**1. Introduction and Overview:**
-- Alice expressed interest in understanding the responsibilities at the north division and the potential for technological innovations.
-....
-### Key Issues Discussed
-....
-//and so on and so forth. Make sure not to miss any nuance or details. 
-"
-}}
-
-JSON Response:"""
-                    
-                    language_directive = f"Please provide the title and summary in {user_output_language}." if user_output_language else ""
-                    
-                    # Format transcription for LLM (convert JSON to clean text format like clipboard copy)
-                    formatted_transcription = format_transcription_for_llm(recording.transcription)
-                    
-                    # Get configurable transcript length limit for reprocessing
-                    transcript_limit = SystemSetting.get_setting('transcript_length_limit', 30000)
-                    if transcript_limit == -1:
-                        # No limit
-                        transcript_text = formatted_transcription
-                    else:
-                        transcript_text = formatted_transcription[:transcript_limit]
-                    
-                    if user_summary_prompt:
-                        prompt_text = f"""Analyze the following audio transcription and generate a concise title and a summary according to the following instructions.
-                
-Transcription:
-\"\"\"
-{transcript_text} 
-\"\"\"
-
-Generate a response STRICTLY as a JSON object with two keys: "title" and "summary". The summary should be markdown content (do NOT wrap in ```markdown code blocks), not JSON. 
-
-For the "title": create a short, descriptive title (max 6 words, no introductory phrases like "brief", "discussion on", "Meeting about").
-For the "summary": {user_summary_prompt}. 
-
-{language_directive}
-
-JSON Response:"""
-                    else:
-                        prompt_text = default_summary_prompt.format(transcription=transcript_text, language_directive=language_directive)
-                    
-                    system_message_content = "You are an AI assistant that generates titles and summaries for meeting transcripts. Respond only with the requested JSON object."
-                    if user_output_language:
-                        system_message_content += f" Ensure your response (both title and summary) is in {user_output_language}."
-                    
-                    # Debug logging: Log the complete prompt being sent to the LLM
-                    app.logger.info(f"Making OpenRouter API request for summary reprocessing {recording_id}")
-                    app.logger.info(f"Sending reprocess summary prompt to LLM (length: {len(prompt_text)} chars). Set LOG_LEVEL=DEBUG to see full prompt details.")
-                    app.logger.debug(f"=== REPROCESS SUMMARY DEBUG for recording {recording_id} ===")
-                    app.logger.debug(f"Model: {TEXT_MODEL_NAME}")
-                    app.logger.debug(f"System message: {system_message_content}")
-                    app.logger.debug(f"User prompt (length: {len(prompt_text)} chars):\n{prompt_text}")
-                    app.logger.debug(f"=== END REPROCESS SUMMARY DEBUG for recording {recording_id} ===")
-                    
-                    # Call OpenRouter API
-                    completion = client.chat.completions.create(
-                        model=TEXT_MODEL_NAME,
-                        messages=[
-                            {"role": "system", "content": system_message_content},
-                            {"role": "user", "content": prompt_text}
-                        ],
-                        temperature=0.5,
-                        max_tokens=int(os.environ.get("SUMMARY_MAX_TOKENS", "3000")),
-                        response_format={"type": "json_object"}
-                    )
-                    
-                    app.logger.info(f"OpenRouter API request completed for summary reprocessing {recording_id}")
-                    
-                    response_content = completion.choices[0].message.content
-                    app.logger.debug(f"Raw OpenRouter response for summary reprocessing {recording_id}: {response_content}")
-                    
-                    # Check if response is empty or None
-                    if not response_content or response_content.strip() == "":
-                        app.logger.error(f"Empty response from OpenRouter for summary reprocessing {recording_id}")
-                        recording.summary = "[AI summary generation failed: Empty response from API]"
-                        recording.status = 'COMPLETED'
-                        db.session.commit()
-                        return
-                    
-                    # Parse response (same logic as in transcribe_audio_task)
-                    json_match = re.search(r'```(?:json)?(.*?)```|(.+)', response_content, re.DOTALL)
-                    
-                    if json_match:
-                        sanitized_response = json_match.group(1) if json_match.group(1) else json_match.group(2)
-                        sanitized_response = sanitized_response.strip()
-                    else:
-                        sanitized_response = response_content.strip()
-                    
-                    # Additional check for empty sanitized response
-                    if not sanitized_response or sanitized_response.strip() in ["{}", ""]:
-                        app.logger.error(f"Empty or invalid JSON response from OpenRouter for summary reprocessing {recording_id}: '{sanitized_response}'")
-                        recording.summary = "[AI summary generation failed: Invalid JSON response]"
-                        recording.status = 'COMPLETED'
-                        db.session.commit()
-                        return
-                        
-                    summary_data = safe_json_loads(sanitized_response, {})
-                    
-                    # Check if the parsed JSON is empty or doesn't contain expected keys
-                    if not summary_data or (not summary_data.get("title") and not summary_data.get("summary")):
-                        app.logger.error(f"OpenRouter returned empty or invalid JSON structure for summary reprocessing {recording_id}: {summary_data}")
-                        recording.summary = "[AI summary generation failed: Empty response structure]"
-                        recording.status = 'COMPLETED'
-                        db.session.commit()
-                        return
-                    
-                    # Debug log the parsed response
-                    app.logger.debug(f"Parsed summary data for reprocessing {recording_id}: {summary_data}")
-                    
-                    raw_title = summary_data.get("title")
-                    raw_summary = summary_data.get("summary")
-                    
-                    # Log what we got from the response
-                    app.logger.debug(f"Raw title for reprocessing {recording_id}: {raw_title}")
-                    app.logger.debug(f"Raw summary for reprocessing {recording_id}: {raw_summary}")
-                    
-                    # Process title
-                    if isinstance(raw_title, str):
-                        processed_title = raw_title.strip()
-                    elif raw_title is None:
-                        processed_title = "[Title not generated]"
-                        app.logger.warning(f"Title was missing in OpenRouter response for summary reprocessing {recording_id}.")
-                    else:
-                        processed_title = "[Title generation error: Unexpected format]"
-                        app.logger.warning(f"Title had unexpected format for summary reprocessing {recording_id}: {type(raw_title)}. Content: {raw_title}")
-                    
-                    # Process summary
-                    if isinstance(raw_summary, str):
-                        processed_summary = raw_summary.strip()
-                    elif isinstance(raw_summary, dict):
-                        processed_summary = json.dumps(raw_summary, indent=2)
-                        app.logger.info(f"Generated summary for reprocessing {recording_id} was a dictionary, converted to JSON string.")
-                    elif raw_summary is None:
-                        processed_summary = "[Summary not generated]"
-                        app.logger.warning(f"Summary was missing in OpenRouter response for summary reprocessing {recording_id}.")
-                    else:
-                        processed_summary = "[Summary generation error: Unexpected format]"
-                        app.logger.warning(f"Summary had unexpected format for summary reprocessing {recording_id}: {type(raw_summary)}. Content: {raw_summary}")
-                    
-                    # Check if both title and summary are valid before updating
-                    if raw_title is not None and raw_summary is not None:
-                        recording.title = processed_title
-                        recording.summary = processed_summary
-                        recording.status = 'COMPLETED'
-                        app.logger.info(f"Summary reprocessing completed successfully for recording {recording_id}")
-                    else:
-                        # Handle cases where one or both keys might be missing
-                        if raw_title is None:
-                            recording.title = recording.title or "[Title not generated]"  # Keep existing if any
-                        else:
-                            recording.title = processed_title
-                        
-                        if raw_summary is None:
-                            recording.summary = "[AI summary generation failed: Missing summary key]"
-                        else:
-                            recording.summary = processed_summary
-                        
-                        app.logger.warning(f"OpenRouter response for summary reprocessing {recording_id} might have lacked 'title' or 'summary'. Title: {raw_title is not None}, Summary: {raw_summary is not None}. Response: {sanitized_response}")
-                        recording.status = 'COMPLETED'  # Still completed, but summary might be partial/failed
-                    
-                    db.session.commit()
-                    
-                except json.JSONDecodeError as json_e:
-                    app.logger.error(f"Failed to parse JSON response from OpenRouter for summary reprocessing {recording_id}: {json_e}. Response: {sanitized_response}")
-                    recording.summary = f"[AI summary generation failed: Invalid JSON response ({json_e})]"
-                    recording.status = 'COMPLETED'
-                    db.session.commit()
-                    
-                except Exception as summary_e:
-                    app.logger.error(f"Error during summary reprocessing for recording {recording_id}: {str(summary_e)}")
-                    recording.summary = format_api_error_message(str(summary_e))
-                    recording.status = 'COMPLETED'
-                    db.session.commit()
+            app.logger.info(f"Starting summary reprocessing for recording {recording_id} using generate_summary_only_task")
+            generate_summary_only_task(app_context, recording_id)
         
         thread = threading.Thread(
             target=reprocess_summary_task,
@@ -3840,40 +4057,16 @@ def account():
         flash('Account details updated successfully!', 'success')
         return redirect(url_for('account'))
         
-    default_summary_prompt_text = """Identify the key issues discussed. First, give me minutes. Then, give me the key issues discussed. Then, any key takeaways. Then, any next steps. Then, all important things that I didn't ask for but that need to be recorded. Make sure every important nuance is covered.
-
-CRITICAL FORMATTING REQUIREMENTS:
-- Each **Bold Key:** value pair MUST be on its own separate line
-- Add a blank line after bold headers when followed by bullet point lists  
-- Never put multiple **Bold:** items on the same line
-- Use proper markdown with consistent line breaks
-
-Example Format:
-
-### Minutes
-
-**Case:** Wisconsin Central v. United States
-
-**Court:** U.S. Supreme Court  
-
-**Date:** Not specified
-
-**Counsel:** John Dupree (Petitioner), Cynthia Covner (Respondent)
-
-**Meeting Participants:**
-
-- Bob  
-- Alice  
-
----
-
-**1. Introduction and Overview:**
-
-- Alice expressed interest in understanding the responsibilities at the north division and the potential for technological innovations.
-....
-### Key Issues Discussed
-....
-//and so on and so forth. Make sure not to miss any nuance or details."""
+    # Get admin default prompt from system settings
+    admin_default_prompt = SystemSetting.get_setting('admin_default_summary_prompt', None)
+    if admin_default_prompt:
+        default_summary_prompt_text = admin_default_prompt
+    else:
+        # Fallback to hardcoded default if admin hasn't set one
+        default_summary_prompt_text = """Generate a comprehensive summary that includes the following sections:
+- **Key Issues Discussed**: A bulleted list of the main topics
+- **Key Decisions Made**: A bulleted list of any decisions reached
+- **Action Items**: A bulleted list of tasks assigned, including who is responsible if mentioned"""
     
     asr_diarize_locked = 'ASR_DIARIZE' in os.environ
     
@@ -4232,13 +4425,33 @@ def get_config():
         # Get configurable file size limit
         max_file_size_mb = SystemSetting.get_setting('max_file_size_mb', 250)
         
+        # Get chunking configuration (supports both legacy and new formats)
+        chunking_info = {}
+        if ENABLE_CHUNKING and chunking_service:
+            mode, limit_value = chunking_service.parse_chunk_limit()
+            chunking_info = {
+                'chunking_enabled': True,
+                'chunking_mode': mode,  # 'size' or 'duration'
+                'chunking_limit': limit_value,  # Value in MB or seconds
+                'chunking_limit_display': f"{limit_value}{'MB' if mode == 'size' else 's'}"
+            }
+        else:
+            chunking_info = {
+                'chunking_enabled': False,
+                'chunking_mode': 'size',
+                'chunking_limit': 20,
+                'chunking_limit_display': '20MB'
+            }
+
         return jsonify({
             'max_file_size_mb': max_file_size_mb,
-            'use_asr_endpoint': USE_ASR_ENDPOINT
+            'use_asr_endpoint': USE_ASR_ENDPOINT,
+            **chunking_info
         })
     except Exception as e:
         app.logger.error(f"Error fetching configuration: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/csrf-token', methods=['GET'])
 @csrf.exempt  # Exempt this endpoint from CSRF protection since it's providing tokens
@@ -4283,6 +4496,217 @@ def get_recordings():
         return jsonify([recording.to_dict() for recording in recordings])
     except Exception as e:
         app.logger.error(f"Error fetching recordings: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/recordings', methods=['GET'])
+@login_required
+@limiter.limit("1250 per hour")
+def get_recordings_paginated():
+    """Get recordings with pagination and server-side filtering."""
+    try:
+        # Parse query parameters
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 25, type=int), 100)  # Cap at 100 per page
+        search_query = request.args.get('q', '').strip()
+        
+        # Build base query
+        stmt = select(Recording).where(Recording.user_id == current_user.id)
+        
+        # Apply search filters if provided
+        if search_query:
+            # Parse search query for special syntax
+            import re
+            
+            # Extract date filters
+            date_filters = re.findall(r'date:(\S+)', search_query.lower())
+            tag_filters = re.findall(r'tag:(\S+)', search_query.lower())
+            
+            # Remove special syntax to get text search
+            text_query = re.sub(r'date:\S+', '', search_query, flags=re.IGNORECASE)
+            text_query = re.sub(r'tag:\S+', '', text_query, flags=re.IGNORECASE).strip()
+            
+            # Apply date filters
+            for date_filter in date_filters:
+                if date_filter == 'today':
+                    today = datetime.now().date()
+                    stmt = stmt.where(
+                        db.or_(
+                            db.func.date(Recording.meeting_date) == today,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) == today
+                            )
+                        )
+                    )
+                elif date_filter == 'yesterday':
+                    yesterday = datetime.now().date() - timedelta(days=1)
+                    stmt = stmt.where(
+                        db.or_(
+                            db.func.date(Recording.meeting_date) == yesterday,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) == yesterday
+                            )
+                        )
+                    )
+                elif date_filter == 'thisweek':
+                    today = datetime.now().date()
+                    start_of_week = today - timedelta(days=today.weekday())
+                    stmt = stmt.where(
+                        db.or_(
+                            Recording.meeting_date >= start_of_week,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) >= start_of_week
+                            )
+                        )
+                    )
+                elif date_filter == 'lastweek':
+                    today = datetime.now().date()
+                    end_of_last_week = today - timedelta(days=today.weekday())
+                    start_of_last_week = end_of_last_week - timedelta(days=7)
+                    stmt = stmt.where(
+                        db.or_(
+                            db.and_(
+                                Recording.meeting_date >= start_of_last_week,
+                                Recording.meeting_date < end_of_last_week
+                            ),
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) >= start_of_last_week,
+                                db.func.date(Recording.created_at) < end_of_last_week
+                            )
+                        )
+                    )
+                elif date_filter == 'thismonth':
+                    today = datetime.now().date()
+                    start_of_month = today.replace(day=1)
+                    stmt = stmt.where(
+                        db.or_(
+                            Recording.meeting_date >= start_of_month,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) >= start_of_month
+                            )
+                        )
+                    )
+                elif date_filter == 'lastmonth':
+                    today = datetime.now().date()
+                    first_day_this_month = today.replace(day=1)
+                    last_day_last_month = first_day_this_month - timedelta(days=1)
+                    first_day_last_month = last_day_last_month.replace(day=1)
+                    stmt = stmt.where(
+                        db.or_(
+                            db.and_(
+                                Recording.meeting_date >= first_day_last_month,
+                                Recording.meeting_date <= last_day_last_month
+                            ),
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) >= first_day_last_month,
+                                db.func.date(Recording.created_at) <= last_day_last_month
+                            )
+                        )
+                    )
+                elif re.match(r'^\d{4}-\d{2}-\d{2}$', date_filter):
+                    # Specific date format YYYY-MM-DD
+                    target_date = datetime.strptime(date_filter, '%Y-%m-%d').date()
+                    stmt = stmt.where(
+                        db.or_(
+                            db.func.date(Recording.meeting_date) == target_date,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.func.date(Recording.created_at) == target_date
+                            )
+                        )
+                    )
+                elif re.match(r'^\d{4}-\d{2}$', date_filter):
+                    # Month format YYYY-MM
+                    year, month = map(int, date_filter.split('-'))
+                    stmt = stmt.where(
+                        db.or_(
+                            db.and_(
+                                db.extract('year', Recording.meeting_date) == year,
+                                db.extract('month', Recording.meeting_date) == month
+                            ),
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.extract('year', Recording.created_at) == year,
+                                db.extract('month', Recording.created_at) == month
+                            )
+                        )
+                    )
+                elif re.match(r'^\d{4}$', date_filter):
+                    # Year format YYYY
+                    year = int(date_filter)
+                    stmt = stmt.where(
+                        db.or_(
+                            db.extract('year', Recording.meeting_date) == year,
+                            db.and_(
+                                Recording.meeting_date.is_(None),
+                                db.extract('year', Recording.created_at) == year
+                            )
+                        )
+                    )
+            
+            # Apply tag filters
+            if tag_filters:
+                # Join with tags table and filter by tag names
+                tag_conditions = []
+                for tag_filter in tag_filters:
+                    tag_conditions.append(Tag.name.ilike(f'%{tag_filter}%'))
+                
+                stmt = stmt.join(RecordingTag).join(Tag).where(db.or_(*tag_conditions))
+            
+            # Apply text search
+            if text_query:
+                text_conditions = [
+                    Recording.title.ilike(f'%{text_query}%'),
+                    Recording.participants.ilike(f'%{text_query}%'),
+                    Recording.transcription.ilike(f'%{text_query}%'),
+                    Recording.notes.ilike(f'%{text_query}%')
+                ]
+                stmt = stmt.where(db.or_(*text_conditions))
+        
+        # Apply ordering (most recent first based on meeting_date or created_at)
+        stmt = stmt.order_by(
+            db.case(
+                (Recording.meeting_date.is_not(None), Recording.meeting_date),
+                else_=db.func.date(Recording.created_at)
+            ).desc(),
+            Recording.created_at.desc()
+        )
+        
+        # Get total count for pagination info
+        count_stmt = select(db.func.count()).select_from(stmt.subquery())
+        total_count = db.session.execute(count_stmt).scalar()
+        
+        # Apply pagination
+        offset = (page - 1) * per_page
+        stmt = stmt.offset(offset).limit(per_page)
+        
+        # Execute query
+        recordings = db.session.execute(stmt).scalars().all()
+        
+        # Calculate pagination metadata
+        total_pages = (total_count + per_page - 1) // per_page
+        has_next = page < total_pages
+        has_prev = page > 1
+        
+        return jsonify({
+            'recordings': [recording.to_dict() for recording in recordings],
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total_count,
+                'total_pages': total_pages,
+                'has_next': has_next,
+                'has_prev': has_prev
+            }
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching paginated recordings: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/inbox_recordings', methods=['GET'])
@@ -4940,8 +5364,7 @@ Examples:
 - "Make this more structured" → DIRECT"""
 
                 try:
-                    router_response = client.chat.completions.create(
-                        model=TEXT_MODEL_NAME,
+                    router_response = call_llm_completion(
                         messages=[
                             {"role": "system", "content": "You are a query router. Respond with only 'RAG' or 'DIRECT'."},
                             {"role": "user", "content": router_prompt}
@@ -4966,8 +5389,7 @@ Previous conversation context (if relevant):
 
 Use proper markdown formatting including headings (##), bold (**text**), bullet points (-), etc."""
 
-                        stream = client.chat.completions.create(
-                            model=TEXT_MODEL_NAME,
+                        stream = call_llm_completion(
                             messages=[
                                 {"role": "system", "content": direct_prompt},
                                 {"role": "user", "content": user_message}
@@ -4977,12 +5399,9 @@ Use proper markdown formatting including headings (##), bold (**text**), bullet 
                             stream=True
                         )
                         
-                        for chunk in stream:
-                            content = chunk.choices[0].delta.content
-                            if content:
-                                yield f"data: {json.dumps({'delta': content})}\n\n"
-                        
-                        yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
+                        # Use helper function to process streaming with thinking tag support
+                        for response in process_streaming_with_thinking(stream):
+                            yield response
                         return
                         
                 except Exception as e:
@@ -5017,8 +5436,7 @@ Examples:
 Respond with only a JSON array of strings: ["term1", "term2", "term3", ...]"""
                 
                 try:
-                    enrichment_response = client.chat.completions.create(
-                        model=TEXT_MODEL_NAME,
+                    enrichment_response = call_llm_completion(
                         messages=[
                             {"role": "system", "content": "You are a query enhancement assistant. Respond only with valid JSON arrays of search terms."},
                             {"role": "user", "content": enrichment_prompt}
@@ -5313,8 +5731,7 @@ Order your response with notes from the most recent meetings first. Always use p
                 messages.append({"role": "user", "content": user_message})
 
                 # Enable streaming
-                stream = client.chat.completions.create(
-                    model=TEXT_MODEL_NAME,
+                stream = call_llm_completion(
                     messages=messages,
                     temperature=0.7,
                     max_tokens=int(os.environ.get("CHAT_MAX_TOKENS", "2000")),
@@ -5324,10 +5741,17 @@ Order your response with notes from the most recent meetings first. Always use p
                 # Buffer content to detect full transcript requests
                 response_buffer = ""
                 
+                # Buffer content to detect full transcript requests
+                response_buffer = ""
+                content_buffer = ""
+                in_thinking = False
+                thinking_buffer = ""
+                
                 for chunk in stream:
                     content = chunk.choices[0].delta.content
                     if content:
                         response_buffer += content
+                        content_buffer += content
                         
                         # Check if this is a full transcript request
                         if response_buffer.strip().startswith("REQUEST_FULL_TRANSCRIPT:"):
@@ -5369,20 +5793,16 @@ Order your response with notes from the most recent meetings first. Always use p
                                             # Generate new response with full context
                                             yield create_status_response('responding', 'Analyzing full transcript...')
                                             
-                                            new_stream = client.chat.completions.create(
-                                                model=TEXT_MODEL_NAME,
+                                            new_stream = call_llm_completion(
                                                 messages=updated_messages,
                                                 temperature=0.7,
                                                 max_tokens=int(os.environ.get("CHAT_MAX_TOKENS", "2000")),
                                                 stream=True
                                             )
                                             
-                                            for new_chunk in new_stream:
-                                                new_content = new_chunk.choices[0].delta.content
-                                                if new_content:
-                                                    yield f"data: {json.dumps({'delta': new_content})}\n\n"
-                                            
-                                            yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
+                                            # Use helper function to process streaming with thinking tag support
+                                            for response in process_streaming_with_thinking(new_stream):
+                                                yield response
                                             return
                                         else:
                                             # Recording not found or no permission
@@ -5396,8 +5816,55 @@ Order your response with notes from the most recent meetings first. Always use p
                                     # Continue with normal streaming
                                     pass
                         
-                        # Normal streaming - yield content as it comes
-                        yield f"data: {json.dumps({'delta': content})}\n\n"
+                        # Process the buffer to detect and handle thinking tags
+                        while True:
+                            if not in_thinking:
+                                # Look for opening thinking tag
+                                think_start = re.search(r'<think(?:ing)?>', content_buffer, re.IGNORECASE)
+                                if think_start:
+                                    # Send any content before the thinking tag
+                                    before_thinking = content_buffer[:think_start.start()]
+                                    if before_thinking:
+                                        yield f"data: {json.dumps({'delta': before_thinking})}\n\n"
+                                    
+                                    # Start capturing thinking content
+                                    in_thinking = True
+                                    content_buffer = content_buffer[think_start.end():]
+                                    thinking_buffer = ""
+                                else:
+                                    # No thinking tag found, send accumulated content
+                                    if content_buffer:
+                                        yield f"data: {json.dumps({'delta': content_buffer})}\n\n"
+                                    content_buffer = ""
+                                    break
+                            else:
+                                # We're inside a thinking tag, look for closing tag
+                                think_end = re.search(r'</think(?:ing)?>', content_buffer, re.IGNORECASE)
+                                if think_end:
+                                    # Capture thinking content up to the closing tag
+                                    thinking_buffer += content_buffer[:think_end.start()]
+                                    
+                                    # Send the thinking content as a special type
+                                    if thinking_buffer.strip():
+                                        yield f"data: {json.dumps({'thinking': thinking_buffer.strip()})}\n\n"
+                                    
+                                    # Continue processing after the closing tag
+                                    in_thinking = False
+                                    content_buffer = content_buffer[think_end.end():]
+                                    thinking_buffer = ""
+                                else:
+                                    # Still inside thinking tag, accumulate content
+                                    thinking_buffer += content_buffer
+                                    content_buffer = ""
+                                    break
+                
+                # Handle any remaining content
+                if in_thinking and thinking_buffer:
+                    # Unclosed thinking tag - send as thinking content
+                    yield f"data: {json.dumps({'thinking': thinking_buffer.strip()})}\n\n"
+                elif content_buffer:
+                    # Regular content
+                    yield f"data: {json.dumps({'delta': content_buffer})}\n\n"
                 
                 yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
                 
