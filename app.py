@@ -6292,7 +6292,6 @@ Optional: Endpoint for stream/bot status (for frontend polling).
 # Like MediaMTX instance
 @app.route('/api/stream_chunk', methods=['POST'])
 def receive_stream_chunk():
-    # Validate shared secret
     import os
     expected_secret = os.environ.get('STREAM_CHUNK_SECRET')
     provided_secret = request.headers.get('X-Stream-Secret')
@@ -6300,12 +6299,31 @@ def receive_stream_chunk():
         app.logger.warning('Unauthorized stream chunk upload attempt')
         return jsonify({'error': 'Unauthorized'}), 401
 
-    # Get raw audio bytes from request
-    raw_bytes = request.data
-    # Optionally get metadata (user/session/recording_id) from headers or JSON
+    # Try to get file from multipart/form-data (Mediamtx POST)
+    file = request.files.get('file')
     recording_id = request.headers.get('X-Recording-ID')
-    # Save chunk as temp WAV file
-    import wave, tempfile, os
+
+    if file:
+        # Save uploaded file directly
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+        file.save(save_path)
+        try:
+            transcribe_single_file(save_path, recording_id)
+        except Exception as e:
+            app.logger.error(f"Error processing stream chunk: {e}")
+            return jsonify({'error': 'Chunk processing failed'}), 500
+        try:
+            os.remove(save_path)
+        except Exception:
+            pass
+        return jsonify({'status': 'chunk processed', 'filename': file.filename})
+
+    # Fallback: handle raw bytes (old method)
+    raw_bytes = request.data
+    if not raw_bytes:
+        return jsonify({'error': 'No chunk data received'}), 400
+
+    import wave, tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix='.wav', dir=app.config['UPLOAD_FOLDER']) as tmp_wav:
         wf = wave.open(tmp_wav, 'wb')
         wf.setnchannels(1)
@@ -6314,13 +6332,11 @@ def receive_stream_chunk():
         wf.writeframes(raw_bytes)
         wf.close()
         tmp_wav_path = tmp_wav.name
-    # Enqueue for transcription/processing
     try:
         transcribe_single_file(tmp_wav_path, recording_id)
     except Exception as e:
         app.logger.error(f"Error processing stream chunk: {e}")
         return jsonify({'error': 'Chunk processing failed'}), 500
-    # Clean up temp file
     try:
         os.remove(tmp_wav_path)
     except Exception:
@@ -6333,4 +6349,4 @@ if __name__ == '__main__':
     # Consider using waitress or gunicorn for production
     # waitress-serve --host 0.0.0.0 --port 8899 app:app
     # For development:
-    app.run(host='0.0.0.0', port=8899, debug=True) # Set debug=False if thread issues arise
+    app.run(host='0.0.0.0', port=8899, debug=False) # Set debug=False if thread issues arise

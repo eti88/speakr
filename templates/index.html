@@ -53,7 +53,13 @@
             <div v-if="showStreamBot" class="mr-4">
                 <button @click="handleStreamBotClick" :class="['px-4 py-2 rounded-lg text-sm flex items-center gap-2 min-w-[120px] justify-center', isStreamBotActive ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-green-600 text-white hover:bg-green-700']">
                     <i :class="isStreamBotActive ? 'fas fa-stop' : 'fas fa-robot'"></i>
-                    <span>{{ isStreamBotActive ? 'Stop Bot Stream' : 'Start Bot Stream' }}</span>
+                    <span>
+                        {% if isStreamBotActive %}
+                            Stop Bot Stream
+                        {% else %}
+                            Start Bot Stream
+                        {% endif %}
+                    </span>
                 </button>
             </div>
             <!-- Left side: Menu toggle and logo -->
@@ -404,7 +410,7 @@
 
                                 <!-- Stream Audio Sources -->
                                 <button @click="startRecording('stream')"
-                                        class="w-full px-4 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors flex items-center justify-center gap-2">
+                                        class="w-full px-4 py-3 bg-orange-600 text-white rounded-lg hover:bg-purple-700 transition-colors flex items-center justify-center gap-2">
                                     <i class="fas fa-robot"></i>
                                     <i class="fas fa-desktop ml-1"></i>
                                     <span>Record Bot</span>
